@@ -1,14 +1,16 @@
 import sys
 import logging
+import json
 from logging.handlers import RotatingFileHandler
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton,
     QVBoxLayout, QHBoxLayout, QStackedWidget, QGraphicsOpacityEffect,
-    QCheckBox, QLabel
+    QCheckBox, QLabel, QLineEdit, QComboBox, QDateEdit, 
+    QListWidget, QInputDialog, QDialog
 )
 from PyQt6.QtCore import (
     Qt, QPropertyAnimation, QEasingCurve,
-    pyqtSignal, pyqtProperty, QSettings, QRect
+    pyqtSignal, pyqtProperty, QSettings, QRect, QDate
 )
 
 logger = logging.getLogger()
@@ -38,7 +40,7 @@ logger.addHandler(file_handler)
 # ---------------------------
 BUTTON_HEIGHT = 40
 SIDEBAR_COLLAPSED_WIDTH = 60
-SIDEBAR_EXPANDED_WIDTH = 200
+SIDEBAR_EXPANDED_WIDTH = 300
 ANIM_DURATION = 250
 TOGGLE_ANIM_DURATION = 200
 FADE_DURATION = 200
@@ -324,6 +326,193 @@ class SettingsPage(QWidget):
         layout.addWidget(label, alignment=Qt.AlignmentFlag.AlignCenter)
 
 
+class TransactionsPage(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.settings = QSettings("Azralithia", "FinanceTracker")  
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("📝 Manage Transactions      ")
+        title.setStyleSheet("font-size: 20px; margin-bottom: 10px;")
+        layout.addWidget(title)
+
+        # Income/Expense selector
+        self.type_row = QHBoxLayout()
+        self.income_btn = QPushButton("Income")
+        self.expense_btn = QPushButton("Expense")
+        for btn in (self.income_btn, self.expense_btn):
+            btn.setCheckable(True)
+            btn.setFixedHeight(35)
+            self.type_row.addWidget(btn)
+        layout.addLayout(self.type_row)
+
+        self.income_btn.clicked.connect(lambda: self.set_type("Income"))
+        self.expense_btn.clicked.connect(lambda: self.set_type("Expense"))
+
+        # Categories 
+        self.categories = {}         
+        self.load_categories()       
+
+        # Default type = Expense
+        self.current_type = "Expense"
+        self.expense_btn.setChecked(True)
+        self.update_type_styles()
+
+        # Category dropdown + edit button
+        cat_row = QHBoxLayout()
+        self.category = QComboBox()
+        self.edit_cat_btn = QPushButton("✏️")
+        self.edit_cat_btn.setFixedWidth(40)
+        cat_row.addWidget(self.category)
+        cat_row.addWidget(self.edit_cat_btn)
+        layout.addLayout(cat_row)
+        self.reload_categories()
+
+        # Form fields
+        self.amount = QLineEdit()
+        self.amount.setPlaceholderText("Amount")
+        self.date = QDateEdit()
+        self.date.setCalendarPopup(True)
+        self.date.setDate(QDate.currentDate())
+        self.notes = QLineEdit()
+        self.notes.setPlaceholderText("Notes (optional)")
+
+        for widget in (self.amount, self.date, self.notes):
+            layout.addWidget(widget)
+
+        self.save_btn = QPushButton("💾 Save Transaction")
+        layout.addWidget(self.save_btn)
+
+        self.feedback = QLabel("")
+        layout.addWidget(self.feedback)
+
+        # Hookups
+        self.edit_cat_btn.clicked.connect(self.edit_categories)
+        self.save_btn.clicked.connect(self.save_transaction)  
+
+    # -=- Helpers -=-
+    def set_type(self, t: str):
+        self.current_type = t
+        self.income_btn.setChecked(t == "Income")
+        self.expense_btn.setChecked(t == "Expense")
+        self.update_type_styles()
+        self.reload_categories()
+
+    def update_type_styles(self):
+        self.income_btn.setStyleSheet(
+            "border: 2px solid green;" if self.current_type == "Income" else ""
+        )
+        self.expense_btn.setStyleSheet(
+            "border: 2px solid red;" if self.current_type == "Expense" else ""
+        )
+
+    def reload_categories(self):
+        self.category.clear()
+        self.category.addItems(self.categories.get(self.current_type, []))
+
+    def edit_categories(self):
+        current = self.categories.get(self.current_type, [])
+        dlg = CategoryEditor(current, self)
+        if dlg.exec():
+            updated = dlg.get_categories()
+            # Basic cleanup: strip blanks, remove duplicates 
+            cleaned = []
+            seen = set()
+            for name in (s.strip() for s in updated):
+                if name and name not in seen:
+                    seen.add(name)
+                    cleaned.append(name)
+            self.categories[self.current_type] = cleaned or ["Other"]
+            self.reload_categories()
+            self.save_categories()  
+
+    def load_categories(self):
+        stored = self.settings.value("categories", None)
+        defaults = {
+            "Income": ["Salary", "Gift", "Bonus", "Other"],
+            "Expense": ["Food", "Rent", "Utilities", "Transport", "Misc"]
+        }
+        if not stored:
+            self.categories = defaults
+            return
+        try:
+            data = json.loads(stored)
+            if not isinstance(data, dict):
+                raise ValueError
+            for key in ("Income", "Expense"):
+                if key not in data or not isinstance(data[key], list) or not data[key]:
+                    data[key] = defaults[key]
+            self.categories = data
+        except Exception:
+            self.categories = defaults
+
+    def save_categories(self):
+        self.settings.setValue("categories", json.dumps(self.categories))
+
+    def save_transaction(self):
+        try:
+            amount = float(self.amount.text())
+            if amount <= 0:
+                raise ValueError("Amount must be positive.")
+        except ValueError as e:
+            self.feedback.setText(f"❌ {e}")
+            return
+
+        tx = {
+            "type": self.current_type.lower(),
+            "amount": amount,
+            "category": self.category.currentText().lower(),
+            "date": self.date.date().toString("yyyy-MM-dd"),
+            "notes": self.notes.text().strip()
+        }
+        logging.getLogger().info(f"Transaction saved: {tx}")
+        self.feedback.setText("✅ Transaction saved!")
+        self.amount.clear()
+        self.notes.clear()
+
+
+class CategoryEditor(QDialog):
+    def __init__(self, categories, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Categories")
+        layout = QVBoxLayout(self)
+
+        self.list = QListWidget()
+        self.list.addItems(categories)
+        layout.addWidget(self.list)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("➕ Add")
+        remove_btn = QPushButton("➖ Remove")
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(remove_btn)
+        layout.addLayout(btn_row)
+
+        save_btn = QPushButton("💾 Save")
+        layout.addWidget(save_btn)
+
+        add_btn.clicked.connect(self.add_category)
+        remove_btn.clicked.connect(self.remove_category)
+        save_btn.clicked.connect(self.accept)
+
+    def add_category(self):
+        text, ok = QInputDialog.getText(self, "New Category", "Enter name:")
+        if ok:
+            text = text.strip()
+            if text:
+                existing = {self.list.item(i).text() for i in range(self.list.count())}
+                if text not in existing:
+                    self.list.addItem(text)
+
+    def remove_category(self):
+        for item in self.list.selectedItems():
+            self.list.takeItem(self.list.row(item))
+
+    def get_categories(self):
+        return [self.list.item(i).text() for i in range(self.list.count())]
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -336,6 +525,8 @@ class MainWindow(QMainWindow):
 
         self.sidebar = Sidebar()
         layout.addWidget(self.sidebar)
+        layout.setContentsMargins(0, 0, 0, 0)   
+        layout.setSpacing(0)
 
         # Pages
         self.stack = QStackedWidget()
@@ -355,6 +546,9 @@ class MainWindow(QMainWindow):
         # Sync toggle state with saved setting
         self.sidebar.theme_switch.setChecked(light)
         self.toggle_theme(light)
+        
+        self.transactions_page = TransactionsPage()
+        self.stack.addWidget(self.transactions_page)
 
     def handle_action(self, action_name: str):
         logger.info(f"Action triggered: {action_name}")
@@ -364,6 +558,8 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.settings_page)
         elif action_name == "Exit":
             self.close()
+        elif action_name == "Manage Transactions":
+            self.stack.setCurrentWidget(self.transactions_page)
 
     def toggle_theme(self, light_mode: bool):
         self.settings.setValue("light_mode", bool(light_mode)) 
@@ -459,8 +655,6 @@ class MainWindow(QMainWindow):
         self.sidebar.theme_switch._track_dark = True
         self.sidebar.theme_switch.update()
 
-
-    
     def apply_light_theme(self):
         self.setStyleSheet("""
             QWidget { 
