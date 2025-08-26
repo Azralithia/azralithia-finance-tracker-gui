@@ -1,12 +1,15 @@
 import sys
-import logging
 import json
+import sqlite3
+import logging
 from logging.handlers import RotatingFileHandler
+from collections import defaultdict
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton,
     QVBoxLayout, QHBoxLayout, QStackedWidget, QGraphicsOpacityEffect,
     QCheckBox, QLabel, QLineEdit, QComboBox, QDateEdit, 
-    QListWidget, QInputDialog, QDialog
+    QListWidget, QInputDialog, QDialog, QScrollArea, QGroupBox,
+    QFrame
 )
 from PyQt6.QtCore import (
     Qt, QPropertyAnimation, QEasingCurve,
@@ -34,7 +37,19 @@ file_handler = RotatingFileHandler(
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
-
+conn = sqlite3.connect("transactions.db")
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL,
+    amount REAL NOT NULL,
+    category TEXT,
+    date DATETIME NOT NULL,
+    note TEXT
+)
+""")
+conn.commit()
 # ---------------------------
 #           Config
 # ---------------------------
@@ -48,7 +63,449 @@ TOGGLE_WIDTH = 60
 TOGGLE_HEIGHT = 28
 TOGGLE_MARGIN = 2
 TOGGLE_PADDING = 6
+DARK_MODE = """
+            #SummaryCard {
+                border: 1px solid #3a3a3a;
+                border-radius: 10px;
+                background: #2b2b2b;
+            }
+            #SummaryCardTitle { 
+                font-size: 13px; 
+                color: #cfcfcf; 
+            }
+            #SummaryCardValue { 
+                font-size: 24px; 
+                font-weight: 600; 
+                color: #ffffff; 
+            }
+            #SummaryGroup { 
+                border: 1px solid #3a3a3a; 
+                border-radius: 10px; 
+            }
+            #SummaryLabelSmall { 
+            color: #e6e6e6; 
+            }
+            #SummaryRow { 
+                color: #eaeaea;
+                font-size: 16px;
+                font-weight: 500;
+                padding: 4px 0px;
+            }
+            QWidget { 
+                background-color: #2c2c2c; 
+                color: white; 
+            }
+            
+            QWidget#SidebarBottom { 
+                background-color: #1a1a1a; 
+            }     
+            
+            QWidget#Sidebar { 
+                background-color: #1a1a1a; 
+                
+            }
 
+            #Sidebar QPushButton {
+                background-color: transparent;
+            }
+            #Sidebar QPushButton:hover {
+                background-color: rgba(255,255,255,0.08);
+            }
+            #Sidebar QPushButton:pressed {
+                background-color: rgba(255,255,255,0.16);
+            }        
+            
+            /* Sidebar buttons */
+            QPushButton { 
+                color: white; 
+                background-color: #2c2c2c;
+                border: none; 
+                border-radius: 4px; 
+                text-align: left;
+                font-size: 14px;
+                padding: 6px;
+                padding-left: 10px; 
+            }
+            /* Submenu indentation */
+            QPushButton[subitem="true"] {
+                padding-left: 30px;
+            }
+            QPushButton:hover { 
+                background-color: #404040; 
+            }
+            QPushButton:pressed { 
+                background-color: #606060;    
+            }
+            QLabel, QCheckBox { 
+                color: white; 
+            }
+            QLineEdit { 
+                background-color: #3a3a3a;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 4px;
+                color: white;
+            }
+            QTableWidget {
+                gridline-color: #555;
+                background-color: #2c2c2c;
+                alternate-background-color: #3a3a3a;
+                color: white;
+                selection-background-color: #505050;
+            }
+            QHeaderView::section {
+                background-color: #3a3a3a;
+                color: white;
+                padding: 4px;
+                border: none;
+            }
+            QComboBox {
+                background-color: #3a3a3a;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 4px;
+                color: white;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2c2c2c;
+                selection-background-color: #404040;
+                color: white;
+            }
+        """
+
+LIGHT_MODE = """
+            #SummaryCard {
+                border: 1px solid #d0d0d0;
+                border-radius: 10px;
+                background: #ffffff;
+            }
+            #SummaryCardTitle { 
+                font-size: 13px; 
+                color: #333; 
+            }
+            #SummaryCardValue { 
+                font-size: 24px; 
+                font-weight: 600; 
+                color: #111; 
+            }
+            #SummaryGroup { 
+                border: 1px solid #e0e0e0; 
+                border-radius: 10px; 
+            }
+            #SummaryLabelSmall { 
+            color: #222; 
+            }
+            #SummaryRow { 
+                color: #222;
+                font-size: 16px;
+                font-weight: 500;
+                padding: 4px 0px;
+            }
+            QWidget { 
+                background-color: #f0f0f0; 
+                color: black; 
+            }
+            
+            QWidget#SidebarBottom { 
+                background-color: #e6e6e6; 
+            }
+            
+            QWidget#Sidebar { 
+                background-color: #e6e6e6; 
+            }
+
+            #Sidebar QPushButton {
+                background-color: transparent;
+            }
+            #Sidebar QPushButton:hover {
+                background-color: rgba(0,0,0,0.06);
+            }
+            #Sidebar QPushButton:pressed {
+                background-color: rgba(0,0,0,0.12);
+            }
+
+            /* Sidebar buttons */
+            QPushButton { 
+                color: black;                      
+                background-color: #f5f5f5; 
+                border: none; 
+                border-radius: 4px;
+                text-align: left;
+                font-size: 14px;
+                padding: 6px;
+                padding-left: 10px;               
+            }
+            /* Submenu indentation */
+            QPushButton[subitem="true"] {
+                padding-left: 30px;
+            }
+            QPushButton:hover { 
+                background-color: #dcdcdc; 
+            }
+            QPushButton:pressed { 
+                background-color: #c0c0c0;    
+            }
+            QLabel, QCheckBox { 
+                color: black; 
+            }
+            QLineEdit { 
+                background-color: white;
+                border: 1px solid #aaa;
+                border-radius: 4px;
+                padding: 4px;
+                color: black;
+            }
+            QTableWidget {
+                gridline-color: #ccc;
+                background-color: white;
+                alternate-background-color: #f5f5f5;
+                color: black;
+                selection-background-color: #d0d0d0;
+            }
+            QHeaderView::section {
+                background-color: #e0e0e0;
+                color: black;
+                padding: 4px;
+                border: none;
+            }
+            QComboBox {
+                background-color: white;
+                border: 1px solid #aaa;
+                border-radius: 4px;
+                padding: 4px;
+                color: black;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #fff;
+                selection-background-color: #dcdcdc;
+                color: black;
+            }
+        """
+
+class ShowSummaryTab(QWidget):
+    def __init__(self, db_path="transactions.db", parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+
+        self._build_ui()
+        # Default to current month
+        self.month_picker.setDate(QDate.currentDate())
+        self.refresh_summary()
+
+    def set_db_path(self, db_path: str):
+        self.db_path = db_path
+        self.refresh_summary()
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(16)
+
+        # Header controls: Month/Year selector + Refresh
+        header = QHBoxLayout()
+        header.setSpacing(12)
+
+        self.month_label = QLabel("📅 Month:")
+        self.month_label.setObjectName("SummaryLabelSmall")
+
+        self.month_picker = QDateEdit()
+        self.month_picker.setCalendarPopup(True)
+        self.month_picker.setDisplayFormat("MMMM yyyy")
+        self.month_picker.setMinimumWidth(180)
+        self.month_picker.dateChanged.connect(self.refresh_summary)
+
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.clicked.connect(self.refresh_summary)
+
+        header.addWidget(self.month_label)
+        header.addWidget(self.month_picker)
+        header.addStretch()
+        header.addWidget(self.refresh_btn)
+
+        # Totals row
+        totals = QHBoxLayout()
+        totals.setSpacing(12)
+
+        self.card_income = self._make_metric_card("Income", "0.00")
+        self.card_expense = self._make_metric_card("Expense", "0.00")
+        self.card_balance = self._make_metric_card("Balance", "0.00")
+
+        totals.addWidget(self.card_income)
+        totals.addWidget(self.card_expense)
+        totals.addWidget(self.card_balance)
+
+        # Breakdown sections inside a scroll area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+
+        inner = QWidget()
+        inner_layout = QHBoxLayout(inner)
+        inner_layout.setContentsMargins(0, 0, 0, 0)
+        inner_layout.setSpacing(16)
+
+        self.gb_income = self._make_group_box("Income Breakdown")
+        self.gb_expense = self._make_group_box("Expense Breakdown")
+        self.gb_income.setObjectName("SummaryCardTitle")
+        self.gb_expense.setObjectName("SummaryCardTitle")
+        
+        inner_layout.addWidget(self.gb_income)
+        inner_layout.addWidget(self.gb_expense)
+
+        scroll.setWidget(inner)
+
+        outer.addLayout(header)
+        outer.addLayout(totals)
+        outer.addWidget(self._hline())
+        outer.addWidget(scroll)
+    
+    def _make_metric_card(self, title: str, value: str) -> QGroupBox:
+        box = QGroupBox()
+        box.setObjectName("SummaryCard")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(16, 12, 16, 16)
+        lay.setSpacing(6)
+
+        lbl_title = QLabel(title)
+        lbl_title.setObjectName("SummaryCardTitle")
+
+        lbl_value = QLabel(value)
+        lbl_value.setObjectName("SummaryCardValue")
+
+        lay.addWidget(lbl_title)
+        lay.addWidget(lbl_value)
+        lay.addStretch()
+
+        box._value_label = lbl_value
+        return box
+
+    def _make_group_box(self, title: str) -> QGroupBox:
+        gb = QGroupBox(title)
+        gb.setObjectName("SummaryGroup")
+        v = QVBoxLayout(gb)
+        v.setContentsMargins(16, 20, 16, 16)  
+        v.setSpacing(8)  
+
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(0, 0, 0, 0)
+        inner_layout.setSpacing(6)  
+
+        v.addWidget(inner)
+        v.addStretch()
+
+        gb._rows_container = inner
+        gb._rows_layout = inner_layout
+        return gb
+
+    def _hline(self):
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        return line
+
+    # --=-- Data / Queries --=--
+    def _get_year_month(self):
+        d = self.month_picker.date()
+        return d.year(), d.month()
+
+    def _connect(self):
+        if not self.db_path:
+            raise RuntimeError("ShowSummaryTab: db_path not set. Call set_db_path(path_to_sqlite).")
+        return sqlite3.connect(self.db_path)
+
+    def _fetch_totals_and_counts(self, year: int, month: int):
+        totals = {'income': 0.0, 'expense': 0.0, 'balance': 0.0}
+        counts_income = defaultdict(lambda: {'total': 0.0, 'count': 0})
+        counts_expense = defaultdict(lambda: {'total': 0.0, 'count': 0})
+
+        query_totals = """
+            SELECT type, COALESCE(SUM(amount), 0) AS total
+            FROM transactions
+            WHERE strftime('%Y', date) = ? AND strftime('%m', date) = ?
+            GROUP BY type
+        """
+        query_counts = """
+            SELECT type, category, COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+            FROM transactions
+            WHERE strftime('%Y', date) = ? AND strftime('%m', date) = ?
+            GROUP BY type, category
+            ORDER BY total DESC
+        """
+
+        ym = (f"{year:04d}", f"{month:02d}")
+        with self._connect() as conn:
+            cur = conn.cursor()
+            # Overall totals
+            for t, total in cur.execute(query_totals, ym):
+                if t.lower() == "income":
+                    totals['income'] = float(total or 0)
+                elif t.lower() == "expense":
+                    totals['expense'] = float(total or 0)
+            totals['balance'] = totals['income'] - totals['expense']
+
+            # Detailed counts per category
+            for t, cat, total_amt, count in cur.execute(query_counts, ym):
+                if (t or "").lower() == "income":
+                    counts_income[cat or "Uncategorized"] = {
+                        'total': float(total_amt or 0),
+                        'count': int(count or 0)
+                    }
+                elif (t or "").lower() == "expense":
+                    counts_expense[cat or "Uncategorized"] = {
+                        'total': float(total_amt or 0),
+                        'count': int(count or 0)
+                    }
+
+        return totals, counts_income, counts_expense
+
+    # ----- Refresh / Render -----
+    def refresh_summary(self):
+        try:
+            y, m = self._get_year_month()
+            totals, c_in, c_ex = self._fetch_totals_and_counts(y, m)
+
+            self.card_income._value_label.setText(f"{totals['income']:.2f}")
+            self.card_expense._value_label.setText(f"{totals['expense']:.2f}")
+            self.card_balance._value_label.setText(f"{totals['balance']:.2f}")
+
+            self._render_breakdown(self.gb_income, c_in)
+            self._render_breakdown(self.gb_expense, c_ex)
+
+        except Exception as e:
+            # Show a error in the UI instead of crashing
+            self.card_income._value_label.setText("—")
+            self.card_expense._value_label.setText("—")
+            self.card_balance._value_label.setText("—")
+            self._render_breakdown(self.gb_income, {"Error": 1})
+            self._render_breakdown(self.gb_expense, {str(e): 1})
+
+    def _render_breakdown(self, groupbox: QGroupBox, data: dict):
+        lay = groupbox._rows_layout
+        while (item := lay.takeAt(0)) is not None:
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        if not data:
+            lbl = QLabel("No data.")
+            lbl.setObjectName("SummaryRow")
+            lay.addWidget(lbl)
+            return
+
+        for cat, info in data.items():
+            total = info['total']
+            count = info['count']
+            capitalized_cat = cat.title() if cat else "Uncategorized"
+            row = QLabel(f"{capitalized_cat} ({count}) — {total:.2f}")
+            row.setObjectName("SummaryRow")
+            lay.addWidget(row)
+    
+    def apply_theme(self, mode: str):
+        if mode == "dark":
+            self.setStyleSheet(DARK_MODE)
+        else:
+            self.setStyleSheet(LIGHT_MODE)
+        self.refresh_summary()
 
 # Light/Dark mode toggle switch
 class ToggleSwitch(QCheckBox):
@@ -333,7 +790,7 @@ class TransactionsPage(QWidget):
 
         layout = QVBoxLayout(self)
 
-        title = QLabel("📝 Manage Transactions      ")
+        title = QLabel("📝 Manage Transactions")
         title.setStyleSheet("font-size: 20px; margin-bottom: 10px;")
         layout.addWidget(title)
 
@@ -464,12 +921,27 @@ class TransactionsPage(QWidget):
             "amount": amount,
             "category": self.category.currentText().lower(),
             "date": self.date.date().toString("yyyy-MM-dd"),
-            "notes": self.notes.text().strip()
+            "note": self.notes.text().strip()
         }
+        conn = sqlite3.connect("transactions.db")
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO transactions (type, amount, category, date, note)
+            VALUES (?, ?, ?, ?, ?)
+        """, (tx['type'], tx['amount'], tx['category'], tx['date'], tx['note']))
+        conn.commit()
+        conn.close()
         logging.getLogger().info(f"Transaction saved: {tx}")
         self.feedback.setText("✅ Transaction saved!")
         self.amount.clear()
         self.notes.clear()
+    
+    def apply_theme(self, mode: str):
+        if mode == "dark":
+            self.setStyleSheet(DARK_MODE)
+        else:
+            self.setStyleSheet(LIGHT_MODE)
+        pass
 
 
 class CategoryEditor(QDialog):
@@ -549,6 +1021,9 @@ class MainWindow(QMainWindow):
         
         self.transactions_page = TransactionsPage()
         self.stack.addWidget(self.transactions_page)
+        self.show_summary_tab = ShowSummaryTab(db_path="transactions.db")
+        self.stack.addWidget(self.show_summary_tab)
+
 
     def handle_action(self, action_name: str):
         logger.info(f"Action triggered: {action_name}")
@@ -560,183 +1035,33 @@ class MainWindow(QMainWindow):
             self.close()
         elif action_name == "Manage Transactions":
             self.stack.setCurrentWidget(self.transactions_page)
+        elif action_name == "Show Summary":
+            self.stack.setCurrentWidget(self.show_summary_tab)
 
     def toggle_theme(self, light_mode: bool):
         self.settings.setValue("light_mode", bool(light_mode)) 
-
+        theme_mode = "light" if light_mode else "dark"
+        
+        # Apply main stylesheet
         if light_mode:
             self.apply_light_theme()
         else:
             self.apply_dark_theme()
+        
+        # Propagate theme to pages that support it
+        if hasattr(self, 'show_summary_tab'):
+            self.show_summary_tab.apply_theme(theme_mode)
+        
+        if hasattr(self, 'transactions_page'):
+            self.transactions_page.apply_theme(theme_mode)
 
     def apply_dark_theme(self):
-        self.setStyleSheet("""
-            QWidget { 
-                background-color: #2c2c2c; 
-                color: white; 
-            }
-            
-            QWidget#SidebarBottom { 
-                background-color: #1a1a1a; 
-            }     
-            
-            QWidget#Sidebar { 
-                background-color: #1a1a1a; 
-                
-            }
-
-            #Sidebar QPushButton {
-                background-color: transparent;
-            }
-            #Sidebar QPushButton:hover {
-                background-color: rgba(255,255,255,0.08);
-            }
-            #Sidebar QPushButton:pressed {
-                background-color: rgba(255,255,255,0.16);
-            }        
-            
-            /* Sidebar buttons */
-            QPushButton { 
-                color: white; 
-                background-color: #2c2c2c;
-                border: none; 
-                border-radius: 4px; 
-                text-align: left;
-                font-size: 14px;
-                padding: 6px;
-                padding-left: 10px; 
-            }
-            /* Submenu indentation */
-            QPushButton[subitem="true"] {
-                padding-left: 30px;
-            }
-            QPushButton:hover { 
-                background-color: #404040; 
-            }
-            QPushButton:pressed { 
-                background-color: #606060;    
-            }
-            QLabel, QCheckBox { 
-                color: white; 
-            }
-            QLineEdit { 
-                background-color: #3a3a3a;
-                border: 1px solid #555;
-                border-radius: 4px;
-                padding: 4px;
-                color: white;
-            }
-            QTableWidget {
-                gridline-color: #555;
-                background-color: #2c2c2c;
-                alternate-background-color: #3a3a3a;
-                color: white;
-                selection-background-color: #505050;
-            }
-            QHeaderView::section {
-                background-color: #3a3a3a;
-                color: white;
-                padding: 4px;
-                border: none;
-            }
-            QComboBox {
-                background-color: #3a3a3a;
-                border: 1px solid #555;
-                border-radius: 4px;
-                padding: 4px;
-                color: white;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #2c2c2c;
-                selection-background-color: #404040;
-                color: white;
-            }
-        """)
+        self.setStyleSheet(DARK_MODE)
         self.sidebar.theme_switch._track_dark = True
         self.sidebar.theme_switch.update()
 
     def apply_light_theme(self):
-        self.setStyleSheet("""
-            QWidget { 
-                background-color: #f0f0f0; 
-                color: black; 
-            }
-            
-            QWidget#SidebarBottom { 
-                background-color: #e6e6e6; 
-            }
-            
-            QWidget#Sidebar { 
-                background-color: #e6e6e6; 
-            }
-
-            #Sidebar QPushButton {
-                background-color: transparent;
-            }
-            #Sidebar QPushButton:hover {
-                background-color: rgba(0,0,0,0.06);
-            }
-            #Sidebar QPushButton:pressed {
-                background-color: rgba(0,0,0,0.12);
-            }
-
-            /* Sidebar buttons */
-            QPushButton { 
-                color: black;                      
-                background-color: #f5f5f5; 
-                border: none; 
-                border-radius: 4px;
-                text-align: left;
-                font-size: 14px;
-                padding: 6px;
-                padding-left: 10px;               
-            }
-            /* Submenu indentation */
-            QPushButton[subitem="true"] {
-                padding-left: 30px;
-            }
-            QPushButton:hover { 
-                background-color: #dcdcdc; 
-            }
-            QPushButton:pressed { 
-                background-color: #c0c0c0;    
-            }
-            QLabel, QCheckBox { 
-                color: black; 
-            }
-            QLineEdit { 
-                background-color: white;
-                border: 1px solid #aaa;
-                border-radius: 4px;
-                padding: 4px;
-                color: black;
-            }
-            QTableWidget {
-                gridline-color: #ccc;
-                background-color: white;
-                alternate-background-color: #f5f5f5;
-                color: black;
-                selection-background-color: #d0d0d0;
-            }
-            QHeaderView::section {
-                background-color: #e0e0e0;
-                color: black;
-                padding: 4px;
-                border: none;
-            }
-            QComboBox {
-                background-color: white;
-                border: 1px solid #aaa;
-                border-radius: 4px;
-                padding: 4px;
-                color: black;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #fff;
-                selection-background-color: #dcdcdc;
-                color: black;
-            }
-        """)
+        self.setStyleSheet(LIGHT_MODE)
         self.sidebar.theme_switch._track_dark = False
         self.sidebar.theme_switch.update()
 
