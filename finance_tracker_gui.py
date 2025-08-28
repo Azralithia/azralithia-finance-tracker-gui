@@ -4,17 +4,27 @@ import sqlite3
 import logging
 from logging.handlers import RotatingFileHandler
 from collections import defaultdict
+from datetime import datetime, timedelta
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton,
     QVBoxLayout, QHBoxLayout, QStackedWidget, QGraphicsOpacityEffect,
     QCheckBox, QLabel, QLineEdit, QComboBox, QDateEdit, 
     QListWidget, QInputDialog, QDialog, QScrollArea, QGroupBox,
-    QFrame
+    QFrame, QTableWidget, QTableWidgetItem, QMessageBox, QFormLayout, 
+    QDialogButtonBox, QHeaderView
 )
 from PyQt6.QtCore import (
     Qt, QPropertyAnimation, QEasingCurve,
     pyqtSignal, pyqtProperty, QSettings, QRect, QDate
 )
+try:
+    import matplotlib.dates as mdates
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
+    MATPLOTLIB_AVAILABLE = True
+except Exception:
+    MATPLOTLIB_AVAILABLE = False
+
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -53,6 +63,7 @@ conn.commit()
 # ---------------------------
 #           Config
 # ---------------------------
+BUTTON_WIDTH = 48
 BUTTON_HEIGHT = 40
 SIDEBAR_COLLAPSED_WIDTH = 60
 SIDEBAR_EXPANDED_WIDTH = 300
@@ -282,14 +293,498 @@ LIGHT_MODE = """
             }
         """
 
-class ShowSummaryTab(QWidget):
+def map_display_format(display_format: str) -> str:
+    if display_format == "(DD-MM-YYYY) | Day-Month-Year":
+        return "dd-MM-yyyy"
+    if display_format == "(MM-DD-YYYY) | Month-Day-Year":
+        return "MM-dd-yyyy"
+    if display_format == "(YYYY-DD-MM) | Year-Day-Month":
+        return "yyyy-dd-MM"
+    return "yyyy-MM-dd" # Default to Year-Month-Day
+
+def graph_format(display_format: str) -> str:
+    if display_format == "dd-MM-yyyy":
+        return "%d-%m-%Y"
+    if display_format == "MM-dd-yyyy":
+        return "%m-%d-%Y"
+    if display_format == "yyyy-dd-mm":
+        return "%Y-%d-%m"
+    return "%Y-%m-%d" # Default to Year-Month-Day
+
+def format_date_for_display(date_str: str) -> str:
+    s = QSettings("Azralithia", "FinanceTracker").value("date_format", "(YYYY-MM-DD) | Year-Month-Day")
+    
+    if " | " in s:
+        s = s.split(" | ")[0].strip("()") 
+    try:
+        y, m, d = date_str.split("-")
+    except Exception:
+        return date_str
+    
+    if s == "DD-MM-YYYY":
+        return f"{d}-{m}-{y}"
+    if s == "MM-DD-YYYY":
+        return f"{m}-{d}-{y}"
+    if s == "YYYY-DD-MM":
+        return f"{y}-{d}-{m}"
+    return f"{y}-{m}-{d}" # Default to Year-Month-Day
+
+class HistoryPage(QWidget):
+    data_changed = pyqtSignal()
     def __init__(self, db_path="transactions.db", parent=None):
         super().__init__(parent)
         self.db_path = db_path
+        self.page_size = 10
+        self.current_page = 0
+        self.total_rows = 0
+        self._build_ui()
+        settings = QSettings("Azralithia", "FinanceTracker")
+        save = settings.value("save_filters", False, type=bool)
+        if save:
+            raw = settings.value("history_filters", None)
+            try:
+                data = json.loads(raw) if raw else None
+            except Exception:
+                data = None
+            if data:
+                self.type_filter.setCurrentText(data.get("type", "All"))
+                self._load_category_filter()
+                self.category_filter.setCurrentText(data.get("category", "All"))
+                
+                current_display_format = settings.value("date_format", "(YYYY-MM-DD) | Year-Month-Day")
+                display_format = map_display_format(current_display_format)
+                self.start_date.setDisplayFormat(display_format)
+                self.end_date.setDisplayFormat(display_format)
+                self.start_date.setDate(QDate.fromString(data.get("start", QDate.currentDate().addMonths(-1).toString("yyyy-MM-dd")), "yyyy-MM-dd"))
+                self.end_date.setDate(QDate.fromString(data.get("end", QDate.currentDate().toString("yyyy-MM-dd")), "yyyy-MM-dd"))
+                self.note_search.setText(data.get("note", ""))
+        self._load_category_filter()
+        self.load_page()
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        # Filters row
+        fr = QHBoxLayout()
+        self.type_filter = QComboBox()
+        self.type_filter.addItems(["All", "Income", "Expense"])
+        self.type_filter.currentIndexChanged.connect(self._load_category_filter)
+        self.type_filter.currentIndexChanged.connect(self._apply_filters)
+        self.category_filter = QComboBox()
+        self.category_filter.addItem("All")
+
+        settings = QSettings("Azralithia", "FinanceTracker")
+        current_display_format = settings.value("date_format", "(YYYY-MM-DD) | Year-Month-Day")
+        display_format = map_display_format(current_display_format)
+        
+        self.start_date = QDateEdit()
+        self.start_date.setCalendarPopup(True)
+        self.start_date.setDisplayFormat(display_format) 
+        self.start_date.setDate(QDate.currentDate().addMonths(-1))
+        
+        self.end_date = QDateEdit()
+        self.end_date.setCalendarPopup(True)
+        self.end_date.setDisplayFormat(display_format)
+        self.end_date.setDate(QDate.currentDate())
+
+        self.note_search = QLineEdit()
+        self.note_search.setPlaceholderText("Search notes…")
+
+        self.apply_btn = QPushButton("Apply")
+        self.reset_btn = QPushButton("Reset")
+
+        for w in (QLabel("Type:"), self.type_filter,
+                  QLabel("Category:"), self.category_filter,
+                  QLabel("From:"), self.start_date,
+                  QLabel("To:"), self.end_date,
+                  self.note_search, self.apply_btn, self.reset_btn):
+            fr.addWidget(w)
+        fr.addStretch()
+        root.addLayout(fr)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(
+            ["ID", "Date", "Type", "Category", "Amount", "Note", "Actions"]
+        )
+        self.table.horizontalHeader().setStretchLastSection(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(6, 100)
+        self.table.verticalHeader().setDefaultSectionSize(36)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.table.cellClicked.connect(self._handle_cell_click)
+        root.addWidget(self.table)
+
+        # Pager
+        pr = QHBoxLayout()
+        self.prev_btn = QPushButton("⬅️")
+        self.next_btn = QPushButton("➡️")
+        for b in (self.prev_btn, self.next_btn):
+            b.setFixedSize(BUTTON_WIDTH, BUTTON_HEIGHT)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.prev_btn.setToolTip("Previous 10")
+        self.next_btn.setToolTip("Next 10")
+        self.page_label = QLabel("Page 1 / 1")
+
+        pr.addStretch()
+        pr.addWidget(self.prev_btn)
+        pr.addWidget(self.next_btn)
+        pr.addWidget(self.page_label)
+        root.addLayout(pr)
+
+        # Hooks
+        self.apply_btn.clicked.connect(self._apply_filters)
+        self.reset_btn.clicked.connect(self._reset_filters)
+        self.prev_btn.clicked.connect(self._prev_page)
+        self.next_btn.clicked.connect(self._next_page)
+        
+    def _handle_cell_click(self, row, column):
+        transaction_id_item = self.table.item(row, 0)
+        if not transaction_id_item:
+            return
+        
+        transaction_id = int(transaction_id_item.text())
+        
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT date, type, category, amount, note FROM transactions WHERE id=?", (transaction_id,))
+        data = cur.fetchone()
+        conn.close()
+        if not data:
+            return 
+        date, ttype, category, amount, note = data
+        dialog = TransactionEditDialog(transaction_id, self.db_path, self)
+
+        # If the user clicks on data from the table, opens up Editing focus on that data
+        if column == 1: 
+            dialog.date_edit.setDate(QDate.fromString(date, "yyyy-MM-dd"))
+            dialog.date_edit.setFocus()
+        elif column == 2: 
+            dialog.type_combo.setCurrentText(ttype.title())
+            dialog.type_combo.setFocus()
+        elif column == 3: 
+            dialog.category_edit.setText(category)
+            dialog.category_edit.setFocus()
+        elif column == 4: 
+            dialog.amount_edit.setText(str(amount))
+            dialog.amount_edit.setFocus()
+        elif column == 5: 
+            dialog.note_edit.setText(note)
+            dialog.note_edit.setFocus()
+        else: 
+            pass
+        if dialog.exec():
+            self.load_page()
+            self.data_changed.emit()
+
+    def update_page_size_from_viewport(self):
+        row_h = self.table.verticalHeader().defaultSectionSize() or 36
+        viewport_h = self.table.viewport().height()
+        if viewport_h <= 0:
+            return False  
+        new_page_size = max(1, viewport_h // row_h)
+        if new_page_size != self.page_size:
+            self.page_size = int(new_page_size)
+            self.current_page = max(0, min(self.current_page, max(0, (self.total_rows - 1) // self.page_size)))
+            return True
+        return False
+
+    # ---------- Filters & Paging ----------
+    def _reset_filters(self):
+        self.type_filter.setCurrentIndex(0)
+        self.category_filter.setCurrentIndex(0)
+        self.start_date.setDate(QDate.currentDate().addMonths(-1))
+        self.end_date.setDate(QDate.currentDate())
+        self.note_search.clear()
+        self.current_page = 0
+        self.load_page()
+
+    def _apply_filters(self):
+        self.current_page = 0
+        self.load_page()
+
+    def _prev_page(self):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.load_page()
+
+    def _next_page(self):
+        max_page = max(0, (self.total_rows - 1) // self.page_size)
+        if self.current_page < max_page:
+            self.current_page += 1
+            self.load_page()
+
+    def _build_where_and_params(self):
+        conds, params = [], []
+
+        t = self.type_filter.currentText()
+        if t != "All":
+            conds.append("lower(type) = ?")
+            params.append(t.lower())
+
+        c = self.category_filter.currentText()
+        if c != "All":
+            conds.append("lower(category) = ?")
+            params.append(c.lower())
+
+        sd = self.start_date.date().toString("yyyy-MM-dd")
+        ed = self.end_date.date().toString("yyyy-MM-dd")
+        if sd:
+            conds.append("date >= ?")
+            params.append(sd)
+        if ed:
+            conds.append("date <= ?")
+            params.append(ed)
+
+        q = self.note_search.text().strip()
+        if q:
+            conds.append("note LIKE ?")
+            params.append(f"%{q}%")
+
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+        return where, params
+
+    def _load_category_filter(self):
+        settings = QSettings("Azralithia", "FinanceTracker")
+        stored = settings.value("categories", None)
+        defaults = {
+            "Income": ["Salary", "Gift", "Bonus", "Other"],
+            "Expense": ["Food", "Rent", "Utilities", "Transport", "Misc"]
+        }
+        try:
+            cats_map = json.loads(stored) if stored else defaults
+        except Exception:
+            cats_map = defaults
+
+        t = self.type_filter.currentText()
+        items = []
+        if t == "All":
+            seen = set()
+            for lst in cats_map.values():
+                for c in lst:
+                    if c and c.lower() not in seen:
+                        seen.add(c.lower())
+                        items.append(c.title())
+        else:
+            items = [c.title() for c in cats_map.get(t, [])]
+
+        self.category_filter.blockSignals(True)
+        current = self.category_filter.currentText()
+        self.category_filter.clear()
+        self.category_filter.addItem("All")
+        for c in items:
+            self.category_filter.addItem(c)
+        if current and current in [self.category_filter.itemText(i) for i in range(self.category_filter.count())]:
+            self.category_filter.setCurrentText(current)
+        self.category_filter.blockSignals(False)
+
+    def load_page(self):
+        where, params = self._build_where_and_params()
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute(f"SELECT COUNT(*) FROM transactions {where}", params)
+        self.total_rows = cur.fetchone()[0]
+
+        limit = self.page_size
+        offset = self.current_page * self.page_size
+        cur.execute(
+            f"""SELECT id, date, type, category, amount, COALESCE(note,'')
+                FROM transactions
+                {where}
+                ORDER BY date DESC, id DESC
+                LIMIT ? OFFSET ?""",
+            (*params, limit, offset),
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        self.table.setRowCount(len(rows))
+        for r, (rid, date, t, cat, amt, note) in enumerate(rows):
+            self.table.setItem(r, 0, QTableWidgetItem(str(rid)))
+            self.table.setItem(r, 1, QTableWidgetItem(format_date_for_display(date)))
+            self.table.setItem(r, 2, QTableWidgetItem(t.title()))
+            self.table.setItem(r, 3, QTableWidgetItem((cat or "").title()))
+            self.table.setItem(r, 4, QTableWidgetItem(f"{amt:.2f}"))
+            self.table.setItem(r, 5, QTableWidgetItem(note))
+
+            edit_btn = QPushButton(" ✏️")
+            delete_btn = QPushButton(" 🗑️")
+            for b, tip in ((edit_btn, "Edit"), (delete_btn, "Delete")):
+                b.setFixedSize(BUTTON_WIDTH, BUTTON_HEIGHT)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.setToolTip(tip)
+
+            edit_btn.clicked.connect(lambda _, _rid=rid: self.edit_transaction(_rid))
+            delete_btn.clicked.connect(lambda _, _rid=rid: self.delete_transaction(_rid))
+
+            btns = QWidget()
+            h = QHBoxLayout(btns)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(6)
+            h.addWidget(edit_btn)
+            h.addWidget(delete_btn)
+            self.table.setRowHeight(r, self.table.verticalHeader().defaultSectionSize())
+            h.addStretch()
+            self.table.setCellWidget(r, 6, btns)
+            self.table.setRowHeight(r, self.table.verticalHeader().defaultSectionSize())
+
+        max_page = max(0, (self.total_rows - 1) // self.page_size)
+        self.page_label.setText(f"Page {self.current_page + 1} / {max_page + 1 if self.total_rows else 1}")
+        self.prev_btn.setEnabled(self.current_page > 0)
+        self.next_btn.setEnabled(self.current_page < max_page)
+
+    # ---------- Actions ----------
+    def delete_transaction(self, transaction_id: int):
+        settings = QSettings("Azralithia", "FinanceTracker")
+        confirm_delete = settings.value("confirm_delete", True, type=bool) 
+        if confirm_delete: 
+            reply = QMessageBox.question(self, 'Confirm Delete', "Are you sure you want to delete this transaction?", 
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No) 
+            if reply == QMessageBox.StandardButton.No: 
+                return 
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM transactions WHERE id=?", (transaction_id,))
+        conn.commit()
+        conn.close()
+        max_page = max(0, (self.total_rows - 2) // self.page_size)
+        self.current_page = min(self.current_page, max_page)
+        self.load_page()
+        self.data_changed.emit()
+
+    def edit_transaction(self, transaction_id: int):
+        dialog = TransactionEditDialog(transaction_id, self.db_path, self)
+        if dialog.exec():
+            self.load_page()
+            self.data_changed.emit()
+
+
+class TransactionEditDialog(QDialog):
+    def __init__(self, transaction_id, db_path, parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self.transaction_id = transaction_id
+        self.setWindowTitle("Edit Transaction")
+        self.resize(400, 220)
+        self.settings = QSettings("Azralithia", "FinanceTracker")
 
         self._build_ui()
-        # Default to current month
-        self.month_picker.setDate(QDate.currentDate())
+        self.load_data()
+
+    def _build_ui(self):
+        layout = QFormLayout(self)
+
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        settings = QSettings("Azralithia", "FinanceTracker")
+        current_display_format = settings.value("date_format", "(YYYY-MM-DD) | Year-Month-Day")
+        display_format = map_display_format(current_display_format)
+        self.date_edit.setDisplayFormat(display_format) 
+
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["Income", "Expense"])
+        self.type_combo.currentIndexChanged.connect(self._load_categories_for_type)
+        
+        self.category_combo = QComboBox()
+        self.amount_edit = QLineEdit()
+        self.note_edit = QLineEdit()
+
+        layout.addRow("Date:", self.date_edit)
+        layout.addRow("Type:", self.type_combo)
+        layout.addRow("Category:", self.category_combo)
+        layout.addRow("Amount:", self.amount_edit)
+        layout.addRow("Note:", self.note_edit)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        btn_box.accepted.connect(self.save_changes)
+        btn_box.rejected.connect(self.reject)
+        layout.addRow(btn_box)
+    
+    def _load_categories_for_type(self):
+        selected_type = self.type_combo.currentText()
+        stored = self.settings.value("categories", None)
+        defaults = {
+            "Income": ["Salary", "Gift", "Bonus", "Other"],
+            "Expense": ["Food", "Rent", "Utilities", "Transport", "Misc"]
+        }
+        try:
+            cats_map = json.loads(stored) if stored else defaults
+        except Exception:
+            cats_map = defaults
+        categories = cats_map.get(selected_type, [])
+        
+        self.category_combo.blockSignals(True) 
+        self.category_combo.clear()
+        for cat in categories:
+            self.category_combo.addItem(cat.title()) 
+        self.category_combo.blockSignals(False)
+
+    def load_data(self):
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT date, type, category, amount, note FROM transactions WHERE id=?", (self.transaction_id,))
+        row = cur.fetchone()
+        conn.close()
+
+        if row:
+            date, ttype, category, amount, note = row
+            self.date_edit.setDate(QDate.fromString(date, "yyyy-MM-dd"))
+            
+            self.type_combo.setCurrentText(ttype.title())
+            self._load_categories_for_type()
+            
+            if category and category.title() in [self.category_combo.itemText(i) for i in range(self.category_combo.count())]:
+                self.category_combo.setCurrentText(category.title())
+            else:
+                if self.category_combo.count() > 0:
+                    self.category_combo.setCurrentIndex(0)
+                else:
+                    self.category_combo.addItem("Other") 
+                    self.category_combo.setCurrentText("Other")
+            self.amount_edit.setText(str(amount))
+            self.note_edit.setText(note or "")
+
+    def save_changes(self):
+        date = self.date_edit.date().toString("yyyy-MM-dd")
+        ttype = self.type_combo.currentText().lower()
+        category = self.category_combo.currentText().lower()
+        try:
+            amount = float(self.amount_edit.text())
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Input", "Amount must be a number.")
+            return
+        note = self.note_edit.text()
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE transactions SET date=?, type=?, category=?, amount=?, note=? WHERE id=?",
+            (date, ttype, category, amount, note, self.transaction_id),
+        )
+        conn.commit()
+        conn.close()
+        self.accept()
+
+
+class SummaryPage(QWidget):
+    def __init__(self, db_path="transactions.db", parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self._build_ui()
+
+        self.start_picker.dateChanged.connect(self.refresh_summary)
+        self.end_picker.dateChanged.connect(self.refresh_summary)
         self.refresh_summary()
 
     def set_db_path(self, db_path: str):
@@ -301,28 +796,35 @@ class ShowSummaryTab(QWidget):
         outer.setContentsMargins(16, 16, 16, 16)
         outer.setSpacing(16)
 
-        # Header controls: Month/Year selector + Refresh
         header = QHBoxLayout()
         header.setSpacing(12)
 
-        self.month_label = QLabel("📅 Month:")
-        self.month_label.setObjectName("SummaryLabelSmall")
+        settings = QSettings("Azralithia", "FinanceTracker")
+        current_display_format = settings.value("date_format", "(YYYY-MM-DD) | Year-Month-Day") 
+        display_format = map_display_format(current_display_format)
 
-        self.month_picker = QDateEdit()
-        self.month_picker.setCalendarPopup(True)
-        self.month_picker.setDisplayFormat("MMMM yyyy")
-        self.month_picker.setMinimumWidth(180)
-        self.month_picker.dateChanged.connect(self.refresh_summary)
+        self.start_label = QLabel("📅 From:")
+        self.start_label.setObjectName("SummaryLabelSmall")
+        self.start_picker = QDateEdit()
+        self.start_picker.setCalendarPopup(True)
+        self.start_picker.setDisplayFormat(display_format)
+        self.start_picker.setDate(QDate.currentDate().addMonths(-1))
+
+        self.end_label = QLabel("To:")
+        self.end_picker = QDateEdit()
+        self.end_picker.setCalendarPopup(True)
+        self.end_picker.setDisplayFormat(display_format) 
+        self.end_picker.setDate(QDate.currentDate())
+
+        header.addWidget(self.start_label)
+        header.addWidget(self.start_picker)
+        header.addWidget(self.end_label)
+        header.addWidget(self.end_picker)
 
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.clicked.connect(self.refresh_summary)
 
-        header.addWidget(self.month_label)
-        header.addWidget(self.month_picker)
-        header.addStretch()
-        header.addWidget(self.refresh_btn)
-
-        # Totals row
+        # Totals
         totals = QHBoxLayout()
         totals.setSpacing(12)
 
@@ -334,7 +836,6 @@ class ShowSummaryTab(QWidget):
         totals.addWidget(self.card_expense)
         totals.addWidget(self.card_balance)
 
-        # Breakdown sections inside a scroll area
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
 
@@ -350,9 +851,16 @@ class ShowSummaryTab(QWidget):
         
         inner_layout.addWidget(self.gb_income)
         inner_layout.addWidget(self.gb_expense)
-
         scroll.setWidget(inner)
-
+    
+        # Graph 
+        if MATPLOTLIB_AVAILABLE:
+            self.graph_fig = Figure(figsize=(4,3), tight_layout=True)
+            self.graph_canvas = FigureCanvas(self.graph_fig)
+            outer.addWidget(self.graph_canvas)
+        else:
+            self.graph_placeholder = QLabel("Graph unavailable (matplotlib not installed)")
+            outer.addWidget(self.graph_placeholder)
         outer.addLayout(header)
         outer.addLayout(totals)
         outer.addWidget(self._hline())
@@ -403,36 +911,124 @@ class ShowSummaryTab(QWidget):
         line.setFrameShadow(QFrame.Shadow.Sunken)
         return line
 
+    def _plot_balance_over_range(self, start_date, end_date):
+        if not MATPLOTLIB_AVAILABLE:
+            return
+        
+        conn = self._connect()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT date,
+               SUM(CASE WHEN lower(type)='income' THEN amount WHEN lower(type)='expense' THEN -amount ELSE 0 END) as net
+            FROM transactions
+            WHERE date >= ? AND date <= ?
+            GROUP BY date
+            ORDER BY date
+        """, (start_date, end_date))
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            dates = []
+            nets = []
+        else:
+            rows_map = {r[0]: r[1] for r in rows}
+            d0 = datetime.strptime(start_date, "%Y-%m-%d")
+            d1 = datetime.strptime(end_date, "%Y-%m-%d")
+            raw_dates = []
+            nets = []
+            running = 0.0
+            cur_date = d0
+            while cur_date <= d1:
+                s = cur_date.strftime("%Y-%m-%d")
+                net = float(rows_map.get(s, 0.0))
+                running += net
+                raw_dates.append(cur_date) 
+                nets.append(running)
+                cur_date += timedelta(days=1)
+            dates = mdates.date2num(raw_dates)
+        # plot
+        self.graph_fig.clf()
+        ax = self.graph_fig.add_subplot(111)
+            
+        settings = QSettings("Azralithia", "FinanceTracker")
+        light_mode = settings.value("light_mode", False, type=bool)
+            
+        if light_mode:
+            ax.set_facecolor("#f0f0f0") 
+            self.graph_fig.set_facecolor("#f0f0f0")
+            ax.tick_params(axis='x', colors='black')
+            ax.tick_params(axis='y', colors='black')
+            ax.yaxis.label.set_color('black')
+            ax.xaxis.label.set_color('black')
+            ax.title.set_color('black')
+            ax.spines['bottom'].set_color('black')
+            ax.spines['top'].set_color('black')
+            ax.spines['right'].set_color('black')
+            ax.spines['left'].set_color('black')
+            ax.grid(True, color='#ccc') 
+            line_color = '#1f77b4' 
+        else:
+            # Dark mode
+            ax.set_facecolor("#2c2c2c") 
+            self.graph_fig.set_facecolor("#2c2c2c")
+            ax.tick_params(axis='x', colors='white')
+            ax.tick_params(axis='y', colors='white')
+            ax.yaxis.label.set_color('white')
+            ax.xaxis.label.set_color('white')
+            ax.title.set_color('white')
+            ax.spines['bottom'].set_color('#555') 
+            ax.spines['top'].set_color('#555')
+            ax.spines['right'].set_color('#555')
+            ax.spines['left'].set_color('#555')
+            ax.grid(True, color='#4a4a4a') 
+            line_color = '#88c0d0' 
+            
+        if dates.size > 0: 
+            ax.plot(dates, nets, color=line_color) 
+            ax.set_title("Balance over Time")
+            ax.set_xlabel("Date")
+            ax.set_ylabel("Balance")
+            current_display_format = settings.value("date_format", "(YYYY-MM-DD) | Year-Month-Day")
+            display_format = map_display_format(current_display_format) 
+            strftime_format = graph_format(display_format)
+            ax.xaxis.set_major_formatter(mdates.DateFormatter(strftime_format))
+            self.graph_fig.autofmt_xdate()
+        else:
+            ax.text(0.5, 0.5, "No data for selected range", ha='center', va='center', color='white' if not light_mode else 'black')
+        self.graph_canvas.draw_idle()
+
     # --=-- Data / Queries --=--
-    def _get_year_month(self):
-        d = self.month_picker.date()
-        return d.year(), d.month()
+    def _get_date_range(self):
+        sd = self.start_picker.date().toString("yyyy-MM-dd")
+        ed = self.end_picker.date().toString("yyyy-MM-dd")
+        return sd, ed
 
     def _connect(self):
         if not self.db_path:
-            raise RuntimeError("ShowSummaryTab: db_path not set. Call set_db_path(path_to_sqlite).")
+            raise RuntimeError("SummaryPage: db_path not set. Call set_db_path(path_to_sqlite).")
         return sqlite3.connect(self.db_path)
 
-    def _fetch_totals_and_counts(self, year: int, month: int):
+    def _fetch_totals_and_counts(self, start_date: str, end_date: str):
         totals = {'income': 0.0, 'expense': 0.0, 'balance': 0.0}
         counts_income = defaultdict(lambda: {'total': 0.0, 'count': 0})
         counts_expense = defaultdict(lambda: {'total': 0.0, 'count': 0})
 
         query_totals = """
-            SELECT type, COALESCE(SUM(amount), 0) AS total
+            SELECT lower(type) AS type, COALESCE(SUM(amount),0) AS total
             FROM transactions
-            WHERE strftime('%Y', date) = ? AND strftime('%m', date) = ?
-            GROUP BY type
+            WHERE date >= ? AND date <= ?
+            GROUP BY lower(type)
         """
         query_counts = """
-            SELECT type, category, COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+            SELECT lower(type) AS type, lower(category) AS category,
+                COALESCE(SUM(amount),0) AS total, COUNT(*) AS count
             FROM transactions
-            WHERE strftime('%Y', date) = ? AND strftime('%m', date) = ?
-            GROUP BY type, category
+            WHERE date >= ? AND date <= ?
+            GROUP BY lower(type), lower(category)
             ORDER BY total DESC
         """
-
-        ym = (f"{year:04d}", f"{month:02d}")
+        ym = (start_date, end_date)
         with self._connect() as conn:
             cur = conn.cursor()
             # Overall totals
@@ -461,8 +1057,8 @@ class ShowSummaryTab(QWidget):
     # ----- Refresh / Render -----
     def refresh_summary(self):
         try:
-            y, m = self._get_year_month()
-            totals, c_in, c_ex = self._fetch_totals_and_counts(y, m)
+            sd, ed = self._get_date_range()
+            totals, c_in, c_ex = self._fetch_totals_and_counts(sd, ed)
 
             self.card_income._value_label.setText(f"{totals['income']:.2f}")
             self.card_expense._value_label.setText(f"{totals['expense']:.2f}")
@@ -470,6 +1066,7 @@ class ShowSummaryTab(QWidget):
 
             self._render_breakdown(self.gb_income, c_in)
             self._render_breakdown(self.gb_expense, c_ex)
+            self._plot_balance_over_range(sd, ed)
 
         except Exception as e:
             # Show a error in the UI instead of crashing
@@ -507,7 +1104,7 @@ class ShowSummaryTab(QWidget):
             self.setStyleSheet(LIGHT_MODE)
         self.refresh_summary()
 
-# Light/Dark mode toggle switch
+
 class ToggleSwitch(QCheckBox):
     thumbChanged = pyqtSignal()
 
@@ -558,6 +1155,8 @@ class ToggleSwitch(QCheckBox):
         self._anim.start()
 
     def _update_emoji(self, checked: bool):
+        if self._emoji == "":
+            return
         self._emoji = "☀️" if checked else "🌙"
         self.update()
 
@@ -602,7 +1201,6 @@ class ToggleSwitch(QCheckBox):
 
         # Emoji inside the thumb (moves with it)
         p.setFont(QFont("Segoe UI Emoji", 11))
-        # On a white thumb, black text is always readable
         p.setPen(QColor("#000"))
         p.drawText(thumb_rect, Qt.AlignmentFlag.AlignCenter, self._emoji)
 
@@ -618,19 +1216,15 @@ class SidebarButton(QPushButton):
         self.full_text = f"{icon} {'    ' if is_subitem else ''}{text}"
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedHeight(BUTTON_HEIGHT)
-        self.setProperty("subitem", is_subitem)  # Used by theme CSS to add left padding
+        self.setProperty("subitem", is_subitem)  # Left padding
 
         self.opacity_effect = QGraphicsOpacityEffect()
         self.setGraphicsEffect(self.opacity_effect)
         self.opacity_anim = QPropertyAnimation(self.opacity_effect, b"opacity")
         self.opacity_anim.setDuration(FADE_DURATION)
 
-        if start_collapsed:
-            self.setText(self.icon_only)
-            self.opacity_effect.setOpacity(0)
-        else:
-            self.setText(self.full_text)
-            self.opacity_effect.setOpacity(1)
+        self.setText(self.icon_only)
+        self.opacity_effect.setOpacity(1)
 
         self.clicked.connect(lambda: self.clicked_action.emit(text))
 
@@ -751,7 +1345,7 @@ class Sidebar(QWidget):
         for btn in self.buttons + self.sub_buttons + [self.exit_btn]:
             btn.set_collapsed(collapsed)
 
-        self.theme_switch.setVisible(not collapsed)   # Show only when expanded
+        self.theme_switch.setVisible(not collapsed)   
 
     def enterEvent(self, event):
         self.animate_sidebar(SIDEBAR_EXPANDED_WIDTH, collapsed=False)
@@ -778,16 +1372,56 @@ class SettingsPage(QWidget):
     def __init__(self):
         super().__init__()
         layout = QVBoxLayout(self)
-        label = QLabel("⚙️ Settings Page")
-        label.setStyleSheet("font-size: 20px;")
-        layout.addWidget(label, alignment=Qt.AlignmentFlag.AlignCenter)
+        label = QLabel("⚙️ Settings")
+        label.setStyleSheet("font-size: 24px;")
+        layout.addWidget(label, alignment=Qt.AlignmentFlag.AlignLeft)
 
+        self.settings = QSettings("Azralithia", "FinanceTracker")
+        
+        # Date format selector
+        df_row = QHBoxLayout()
+        df_row.addWidget(QLabel("Date format:"))
+        self.date_format_combo = QComboBox()
+        self.date_format_combo.addItems(["(DD-MM-YYYY) | Day-Month-Year", "(MM-DD-YYYY) | Month-Day-Year", "(YYYY-MM-DD) | Year-Month-Day",  "(YYYY-DD-MM) | Year-Day-Month"])
+        current_fmt = self.settings.value("date_format", "yyyy-MM-dd")
+        self.date_format_combo.setCurrentText(current_fmt)
+        df_row.addWidget(self.date_format_combo)
+        df_row.addStretch()
+        layout.addLayout(df_row)
+
+        # Save filters toggle
+        row = QHBoxLayout()
+        save_filters_label = QLabel("Save filters on exit") 
+        save_filters_label.setStyleSheet("font-size: 16px;") 
+        row.addWidget(save_filters_label)
+            
+        self.save_filters_switch = ToggleSwitch()
+        self.save_filters_switch._emoji = "" 
+        sf = self.settings.value("save_filters", False, type=bool)
+        self.save_filters_switch.setChecked(bool(sf))
+            
+        row.addWidget(self.save_filters_switch)
+        row.addStretch() 
+        layout.addLayout(row)
+        confirm_delete_row = QHBoxLayout() 
+        confirm_delete_label = QLabel("Confirm delete transactions") 
+        confirm_delete_label.setStyleSheet("font-size: 16px;") 
+        confirm_delete_row.addWidget(confirm_delete_label) 
+        self.confirm_delete_switch = ToggleSwitch() 
+        self.confirm_delete_switch._emoji = "" 
+        cd = self.settings.value("confirm_delete", True, type=bool) # Default to True 
+        self.confirm_delete_switch.setChecked(bool(cd)) 
+        confirm_delete_row.addWidget(self.confirm_delete_switch) 
+        confirm_delete_row.addStretch() 
+        layout.addLayout(confirm_delete_row) 
+        layout.addStretch()
+        
 
 class TransactionsPage(QWidget):
+    data_changed = pyqtSignal()
     def __init__(self):
         super().__init__()
-        self.settings = QSettings("Azralithia", "FinanceTracker")  
-
+        self.settings = QSettings("Azralithia", "FinanceTracker")
         layout = QVBoxLayout(self)
 
         title = QLabel("📝 Manage Transactions")
@@ -819,8 +1453,8 @@ class TransactionsPage(QWidget):
         # Category dropdown + edit button
         cat_row = QHBoxLayout()
         self.category = QComboBox()
-        self.edit_cat_btn = QPushButton("✏️")
-        self.edit_cat_btn.setFixedWidth(40)
+        self.edit_cat_btn = QPushButton(" ✏️")
+        self.edit_cat_btn.setFixedWidth(BUTTON_WIDTH)
         cat_row.addWidget(self.category)
         cat_row.addWidget(self.edit_cat_btn)
         layout.addLayout(cat_row)
@@ -832,6 +1466,12 @@ class TransactionsPage(QWidget):
         self.date = QDateEdit()
         self.date.setCalendarPopup(True)
         self.date.setDate(QDate.currentDate())
+
+        settings = QSettings("Azralithia", "FinanceTracker")
+        current_display_format = settings.value("date_format", "(YYYY-MM-DD) | Year-Month-Day")
+        display_format = map_display_format(current_display_format)
+        self.date.setDisplayFormat(display_format)
+
         self.notes = QLineEdit()
         self.notes.setPlaceholderText("Notes (optional)")
 
@@ -847,6 +1487,74 @@ class TransactionsPage(QWidget):
         # Hookups
         self.edit_cat_btn.clicked.connect(self.edit_categories)
         self.save_btn.clicked.connect(self.save_transaction)  
+
+        # Recent transactions preview
+        recent_label = QLabel("Recent transactions")
+        recent_label.setStyleSheet("font-weight:600; margin-top:8px;")
+        layout.addWidget(recent_label)
+
+        self.recent_table = QTableWidget()
+        self.recent_table.setColumnCount(6)
+        self.recent_table.setHorizontalHeaderLabels(["Date", "Type", "Category", "Amount","Note", "Actions"])
+        self.recent_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        header = self.recent_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch) 
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch) 
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch) 
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch) 
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch) 
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)   
+        self.recent_table.setColumnWidth(5, 100) 
+        self.recent_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.recent_table)
+    
+    def showEvent(self, event):
+            self.load_recent_transactions()
+            super().showEvent(event)
+
+    def load_recent_transactions(self, limit=10):
+        conn = sqlite3.connect("transactions.db")
+        cur = conn.cursor()
+        cur.execute("SELECT id, date, type, category, amount, COALESCE(note,'') FROM transactions ORDER BY id DESC LIMIT ?", (limit,)) 
+        rows = cur.fetchall()
+        conn.close()
+
+        self.recent_table.setRowCount(len(rows))
+        for r, (rid, date, t, cat, amt, note) in enumerate(rows): 
+            self.recent_table.setItem(r, 0, QTableWidgetItem(format_date_for_display(date)))
+            self.recent_table.setItem(r, 1, QTableWidgetItem(t.title()))
+            self.recent_table.setItem(r, 2, QTableWidgetItem((cat or "").title()))
+            self.recent_table.setItem(r, 3, QTableWidgetItem(f"{amt:.2f}"))
+            self.recent_table.setItem(r, 4, QTableWidgetItem(note)) 
+            edit_btn = QPushButton(" ✏️")
+            del_btn = QPushButton(" 🗑️")
+            edit_btn.setFixedSize(BUTTON_WIDTH,BUTTON_HEIGHT-10); del_btn.setFixedSize(BUTTON_WIDTH,BUTTON_HEIGHT-10)
+            edit_btn.clicked.connect(lambda _, _rid=rid: self._edit_from_preview(_rid))
+            del_btn.clicked.connect(lambda _, _rid=rid: self._delete_from_preview(_rid))
+            w = QWidget(); h = QHBoxLayout(w); h.setContentsMargins(0,0,0,0); h.addWidget(edit_btn); h.addWidget(del_btn); h.addStretch()
+            self.recent_table.setCellWidget(r, 5, w) 
+
+    def _edit_from_preview(self, rid):
+        dlg = TransactionEditDialog(rid, "transactions.db", self)
+        if dlg.exec():
+            self.load_recent_transactions()
+            self.data_changed.emit()
+
+    def _delete_from_preview(self, rid):
+        settings = QSettings("Azralithia", "FinanceTracker") 
+        confirm_delete = settings.value("confirm_delete", True, type=bool) 
+        if confirm_delete: 
+            reply = QMessageBox.question(self, 'Confirm Delete', "Are you sure you want to delete this transaction?", 
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No) 
+            if reply == QMessageBox.StandardButton.No: 
+                return 
+        conn = sqlite3.connect("transactions.db")
+        cur = conn.cursor()
+        cur.execute("DELETE FROM transactions WHERE id=?", (rid,))
+        conn.commit()
+        conn.close()
+        self.load_recent_transactions()
+        self.data_changed.emit()
 
     # -=- Helpers -=-
     def set_type(self, t: str):
@@ -873,7 +1581,6 @@ class TransactionsPage(QWidget):
         dlg = CategoryEditor(current, self)
         if dlg.exec():
             updated = dlg.get_categories()
-            # Basic cleanup: strip blanks, remove duplicates 
             cleaned = []
             seen = set()
             for name in (s.strip() for s in updated):
@@ -935,6 +1642,8 @@ class TransactionsPage(QWidget):
         self.feedback.setText("✅ Transaction saved!")
         self.amount.clear()
         self.notes.clear()
+        self.data_changed.emit()
+        self.load_recent_transactions()
     
     def apply_theme(self, mode: str):
         if mode == "dark":
@@ -989,6 +1698,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Azralithia Finance Tracker")
+        self.setMinimumSize(1200, 700)
         self.setGeometry(200, 200, 900, 600)
 
         central_widget = QWidget()
@@ -1021,8 +1731,59 @@ class MainWindow(QMainWindow):
         
         self.transactions_page = TransactionsPage()
         self.stack.addWidget(self.transactions_page)
-        self.show_summary_tab = ShowSummaryTab(db_path="transactions.db")
+        self.show_summary_tab = SummaryPage(db_path="transactions.db")
         self.stack.addWidget(self.show_summary_tab)
+        self.history_page = HistoryPage(db_path="transactions.db")
+        self.stack.addWidget(self.history_page)
+
+        self.transactions_page.data_changed.connect(self.on_data_changed)
+        self.history_page.data_changed.connect(self.on_data_changed)
+        self.transactions_page.data_changed.connect(self.history_page._load_category_filter)
+        self.transactions_page.data_changed.connect(self.history_page.load_page)
+    
+    # Connect setting toggle to QSettings
+        self.settings_page.save_filters_switch.toggled.connect(lambda v: self.settings.setValue("save_filters", bool(v)))
+        self.settings_page.date_format_combo.currentTextChanged.connect(
+            lambda v: (self.settings.setValue("date_format", v), self.on_date_format_changed())
+        )
+        self.settings_page.confirm_delete_switch.toggled.connect(lambda v: self.settings.setValue("confirm_delete", bool(v)))
+
+    def closeEvent(self, event):
+        save = self.settings.value("save_filters", False, type=bool)
+        if save and hasattr(self, "history_page"):
+            filters = {
+                "type": self.history_page.type_filter.currentText(),
+                "category": self.history_page.category_filter.currentText(),
+                "start": self.history_page.start_date.date().toString("yyyy-MM-dd"),
+                "end": self.history_page.end_date.date().toString("yyyy-MM-dd"),
+                "note": self.history_page.note_search.text()
+            }
+            self.settings.setValue("history_filters", json.dumps(filters))
+        super().closeEvent(event)
+
+    def on_date_format_changed(self):
+        settings = QSettings("Azralithia", "FinanceTracker")
+        current_display_format = settings.value("date_format", "(YYYY-MM-DD) | Year-Month-Day")
+        display_format = map_display_format(current_display_format)
+
+        if hasattr(self, "history_page"):
+            self.history_page.start_date.setDisplayFormat(display_format)
+            self.history_page.end_date.setDisplayFormat(display_format)
+            self.history_page.load_page()
+
+        if hasattr(self, "transactions_page"):
+            self.transactions_page.date.setDisplayFormat(display_format)
+            self.transactions_page.load_recent_transactions() 
+        
+        if hasattr(self, "show_summary_tab"):
+            self.show_summary_tab.start_picker.setDisplayFormat(display_format)
+            self.show_summary_tab.end_picker.setDisplayFormat(display_format)
+            self.show_summary_tab.refresh_summary()
+
+    
+    def on_data_changed(self):
+        self.show_summary_tab.refresh_summary()
+        self.history_page.load_page()  
 
 
     def handle_action(self, action_name: str):
@@ -1037,12 +1798,14 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.transactions_page)
         elif action_name == "Show Summary":
             self.stack.setCurrentWidget(self.show_summary_tab)
+        elif action_name == "Transaction Log":
+            self.stack.setCurrentWidget(self.history_page)
 
     def toggle_theme(self, light_mode: bool):
         self.settings.setValue("light_mode", bool(light_mode)) 
         theme_mode = "light" if light_mode else "dark"
         
-        # Apply main stylesheet
+        # Main Stylesheet
         if light_mode:
             self.apply_light_theme()
         else:
